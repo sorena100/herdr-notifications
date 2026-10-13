@@ -52,6 +52,13 @@ user's permissions, including inherited environment and filesystem access.
    5.4.2. The updated lockfile passes `cargo audit` with no vulnerabilities or
    warnings at review time. Future advisories still require rechecking.
 5. **Reproducibility:** use `cargo build --release --locked` on installation.
+6. **Focus ordering and acknowledgement:** raise the host window before the
+   final pane selection, then validate that the API response acknowledges the
+   exact requested pane as focused. The local-workspace flow was manually
+   verified on Hyprland/Ghostty. Optional `HERDR_NOTIFICATIONS_TRACE=1` logs
+   notification display, daemon activation, window raising and focus-request
+   timestamps. A live trace confirmed no host raise until the default click
+   action arrived.
 
 The fork also permits opt-in window raising through plugin `config.json` so a
 running server need not be restarted merely to change its inherited environment.
@@ -61,7 +68,12 @@ propagation, parent-window resolution and malformed addresses.
 ## Remaining limitations
 
 - The plugin is server-side. A local install does not deliver events from remote
-  SSH servers; their desktop connections are a separate problem.
+  SSH servers; their desktop connections are a separate problem. Even for a
+  **local** notification, focusing the local server's pane does not switch an
+  attached UI from a selected remote machine back to Local. Cross-machine UI
+  activation needs a client-side control path; a successful server focus response
+  is not proof that the user sees the target. Ghostty's window title can also lag
+  behind actual Herdr navigation, so it is not a reliable verification signal.
 - Candidate UI clients are discovered heuristically from processes, not bound
   to the notification's exact server/client connection. With multiple Herdr
   sessions or desktop windows it may raise the wrong one. API focus may also

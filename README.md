@@ -58,12 +58,19 @@ This is read on each notification click. `HERDR_NOTIFICATIONS_RAISE_HOST`, when
 set, takes precedence (`1` enables, any other value disables). On Hyprland the
 plugin imports the UI client's compositor connection variable and resolves the
 terminal window by walking the Herdr client's parent processes, rather than
-trying to focus the windowless Herdr process itself.
+trying to focus the windowless Herdr process itself. It raises that window first,
+then selects the pane. Set `HERDR_NOTIFICATIONS_TRACE=1` for timestamped click and
+focus diagnostics.
 
 The plugin runs on the server where it is installed. Installing locally does
 not relay status changes from saved SSH machines to the local desktop. Do not
 turn off Herdr's built-in notifications if you still need those remote events.
 Keeping both enabled can produce duplicate notifications for local agents.
+
+**Cross-machine selection is not supported:** if the UI is currently displaying
+a saved remote machine, a local notification can focus the local server's pane
+but cannot switch the UI's machine selector back to Local. The verified workflow
+is clicking a local agent notification while the UI is already on Local.
 
 ## Usage
 

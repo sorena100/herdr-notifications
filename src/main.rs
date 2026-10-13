@@ -525,6 +525,7 @@ fn send_notification(
             }
         };
         let shown_at = Instant::now();
+        notification_trace("notification shown; waiting for activation");
         let _ = shown_tx.send(Ok(()));
 
         if let Some(pane_id) = click_target {
@@ -809,6 +810,10 @@ struct OutcomeHandler {
 
 impl ResponseHandler for OutcomeHandler {
     fn call(self, response: &NotificationResponse) {
+        notification_trace(&format!(
+            "daemon response after {}ms: {response:?}",
+            self.shown_at.elapsed().as_millis()
+        ));
         let outcome = classify_response(
             response,
             self.dismiss_is_click,
@@ -841,29 +846,71 @@ fn normalize_action_response(response: &ActionResponse<'_>) -> NotificationRespo
 /// hands every plugin process via $HERDR_BIN_PATH (falling back to `herdr`
 /// on PATH) rather than talking to the socket API directly.
 ///
-/// On Linux, when [`should_raise_host_window`] is enabled, also raises the OS
-/// window that hosts the Herdr UI client (`herdr agent focus` only switches
-/// the pane inside Herdr).
+/// Raise the host before selecting the pane, so terminal activation does not
+/// follow (and potentially interfere with) the final pane selection.
 fn focus_pane(pane_id: &str) {
-    let bin = herdr_bin();
-    match Command::new(&bin)
-        .args(["agent", "focus", pane_id])
-        .output()
+    let result = activate_then_focus(
+        || {
+            if should_raise_host_window() {
+                notification_trace("raising host window after activation");
+                raise_herdr_host_window();
+            }
+        },
+        || {
+            notification_trace(&format!("requesting focus for {pane_id}"));
+            let bin = herdr_bin();
+            let output = Command::new(&bin)
+                .args(["agent", "focus", pane_id])
+                .output()
+                .map_err(|err| format!("failed to run '{bin}': {err}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "agent focus failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            verify_focus_response(&output.stdout, pane_id)
+        },
+    );
+    match result {
+        Ok(()) => eprintln!("herdr-notifications: server acknowledged focus for {pane_id}"),
+        Err(err) => eprintln!("herdr-notifications: focus failed for {pane_id}: {err}"),
+    }
+}
+
+fn notification_trace(message: &str) {
+    if env::var("HERDR_NOTIFICATIONS_TRACE").as_deref() == Ok("1") {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        eprintln!("herdr-notifications: {millis} {message}");
+    }
+}
+
+fn activate_then_focus(
+    activate: impl FnOnce(),
+    focus: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    activate();
+    focus()
+}
+
+fn verify_focus_response(bytes: &[u8], pane_id: &str) -> Result<(), String> {
+    let response: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|err| format!("invalid focus response: {err}"))?;
+    if response
+        .pointer("/result/agent/pane_id")
+        .and_then(|id| id.as_str())
+        != Some(pane_id)
+        || response
+            .pointer("/result/agent/focused")
+            .and_then(|focused| focused.as_bool())
+            != Some(true)
     {
-        Ok(output) if !output.status.success() => {
-            eprintln!(
-                "herdr-notifications: `{bin} agent focus {pane_id}` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(e) => {
-            eprintln!("herdr-notifications: failed to run '{bin}' to focus pane {pane_id}: {e}");
-        }
-        _ => {}
+        return Err("server did not acknowledge the requested pane as focused".into());
     }
-    if should_raise_host_window() {
-        raise_herdr_host_window();
-    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1826,6 +1873,36 @@ fn default_state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_activates_host_before_final_pane_selection() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        activate_then_focus(
+            || steps.borrow_mut().push("raise"),
+            || {
+                steps.borrow_mut().push("focus");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*steps.borrow(), ["raise", "focus"]);
+        assert!(activate_then_focus(|| {}, || Err("focus failed".into())).is_err());
+    }
+
+    #[test]
+    fn focus_response_must_confirm_exact_target() {
+        let response = br#"{"result":{"agent":{"pane_id":"w1:p7","focused":true}}}"#;
+        assert!(verify_focus_response(response, "w1:p7").is_ok());
+        assert!(verify_focus_response(response, "w2:p7").is_err());
+        assert!(
+            verify_focus_response(
+                br#"{"result":{"agent":{"pane_id":"w1:p7","focused":false}}}"#,
+                "w1:p7"
+            )
+            .is_err()
+        );
+        assert!(verify_focus_response(b"not json", "w1:p7").is_err());
+    }
 
     #[test]
     fn standard_notifications_register_default_and_close_actions() {

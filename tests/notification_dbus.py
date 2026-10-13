@@ -80,7 +80,9 @@ def run_case(server, root, response):
         'if sys.argv[1:3] == ["agent", "focus"]:\n'
         '    with open(os.environ["TEST_FOCUS_LOG"], "w") as f:\n'
         '        json.dump(sys.argv[1:], f)\n'
-        'print(json.dumps({"result":{"panes":[],"tabs":[],"workspaces":[]}}))\n'
+        '    print(json.dumps({"result":{"agent":{"pane_id":sys.argv[3],"focused":True}}}))\n'
+        'else:\n'
+        '    print(json.dumps({"result":{"panes":[],"tabs":[],"workspaces":[]}}))\n'
     )
     stub.chmod(0o700)
     env = dict(os.environ)
