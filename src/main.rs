@@ -1285,6 +1285,32 @@ fn hyprland_host_address(
 }
 
 #[cfg(target_os = "linux")]
+fn dispatch_hyprland_focus(address: &str, mut run: impl FnMut(&[String]) -> bool) -> bool {
+    // The address is embedded in Lua on modern Hyprland: accept only an
+    // actual hexadecimal window address, never arbitrary compositor text.
+    if !address
+        .strip_prefix("0x")
+        .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok())
+    {
+        return false;
+    }
+    let commands = [
+        vec![
+            "dispatch".into(),
+            format!(r#"hl.dsp.focus({{ window = "address:{address}" }})"#),
+        ],
+        vec![
+            "dispatch".into(),
+            "focuswindow".into(),
+            format!("address:{address}"),
+        ],
+    ];
+    // Hyprland 0.56+ uses Lua dispatch. Retain the legacy command as a
+    // fallback for older compositors, matching Omarchy's own focus helper.
+    commands.iter().any(|args| run(args))
+}
+
+#[cfg(target_os = "linux")]
 fn linux_hyprland_focus_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
     if gui.hyprland_instance_signature.is_none() {
         return false;
@@ -1307,12 +1333,40 @@ fn linux_hyprland_focus_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
     let Some(address) = hyprland_host_address(pid, &windows, linux_parent_pid) else {
         return false;
     };
-    let mut cmd = Command::new("hyprctl");
-    cmd.args(["dispatch", "focuswindow", &format!("address:{address}")]);
-    gui.apply_to(&mut cmd);
-    cmd.output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok")
-        .unwrap_or(false)
+    let mut errors = Vec::new();
+    let focused = dispatch_hyprland_focus(&address, |args| {
+        let mut cmd = Command::new("hyprctl");
+        cmd.args(args);
+        gui.apply_to(&mut cmd);
+        match cmd.output() {
+            Ok(output)
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() == "ok" =>
+            {
+                true
+            }
+            Ok(output) => {
+                errors.push(format!(
+                    "{}: {} {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+                false
+            }
+            Err(err) => {
+                errors.push(err.to_string());
+                false
+            }
+        }
+    });
+    if !focused {
+        eprintln!(
+            "herdr-notifications: Hyprland focus failed for {address}: {}",
+            errors.join("; ")
+        );
+    }
+    focused
 }
 
 #[cfg(target_os = "linux")]
@@ -1847,6 +1901,46 @@ mod tests {
             Some("0xabc")
         );
         assert_eq!(hyprland_host_address(200, &windows, parent), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hyprland_prefers_lua_dispatch_and_stops_after_success() {
+        let mut calls = Vec::new();
+        assert!(dispatch_hyprland_focus("0xabc", |args| {
+            calls.push(args.to_vec());
+            true
+        }));
+        assert_eq!(
+            calls,
+            vec![vec![
+                "dispatch",
+                r#"hl.dsp.focus({ window = "address:0xabc" })"#
+            ]]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hyprland_falls_back_to_legacy_dispatch() {
+        let mut calls = Vec::new();
+        assert!(dispatch_hyprland_focus("0xabc", |args| {
+            calls.push(args.to_vec());
+            args.get(1).is_some_and(|arg| arg == "focuswindow")
+        }));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1], ["dispatch", "focuswindow", "address:0xabc"]);
+        assert!(!dispatch_hyprland_focus("0xabc", |_| false));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hyprland_dispatch_rejects_non_hex_input_without_running_commands() {
+        for address in ["", "0x", "0xabc\" }); os.execute(\"bad\")", ".*"] {
+            assert!(!dispatch_hyprland_focus(address, |_| panic!(
+                "must not dispatch"
+            )));
+        }
     }
 
     #[test]

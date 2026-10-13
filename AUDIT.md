@@ -39,7 +39,11 @@ user's permissions, including inherited environment and filesystem access.
 2. **Wrong Hyprland target:** upstream attempts to focus the Herdr process PID,
    which does not own the terminal window. Resolve an actual window from
    `hyprctl clients -j` along the client's parent chain and focus its address.
-   No matching window is a failure, not an assumed successful focus.
+   No matching window is a failure, not an assumed successful focus. Use the
+   Lua `hl.dsp.focus` dispatcher on modern Hyprland, falling back to the legacy
+   `focuswindow` command. A real notification click exposed this version mismatch:
+   pane focus succeeded, but Hyprland 0.56.2 rejected the legacy command. Addresses
+   are hex-validated before insertion into Lua; dispatcher failures are logged.
 3. **Missing compositor environment:** import `HYPRLAND_INSTANCE_SIGNATURE`
    from the candidate UI client and pass it to `hyprctl`. Do not combine missing
    environment values from multiple candidate clients.
