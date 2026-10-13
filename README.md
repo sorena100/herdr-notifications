@@ -1,5 +1,12 @@
 # herdr-notifications
 
+This is [sorena100's fork](https://github.com/sorena100/herdr-notifications) of
+[quinnjr/herdr-notifications](https://github.com/quinnjr/herdr-notifications).
+It fixes default notification actions for Omarchy and host-window discovery
+for Hyprland, and builds with the checked-in dependency lockfile. The plugin ID
+remains `quinnjr.herdr-notifications` for compatibility; do not install both copies.
+See [AUDIT.md](AUDIT.md) for the review scope and remaining limitations.
+
 Native OS desktop notifications for [herdr](https://herdr.dev) agent status
 changes — get pinged by your system's real notification center when an
 agent needs you or finishes a task, instead of having to keep an eye on the
@@ -28,11 +35,35 @@ terminal.
 ## Install
 
 ```sh
-herdr plugin install quinnjr/herdr-notifications
+herdr plugin install sorena100/herdr-notifications
 ```
 
 herdr builds the plugin (`cargo build --release`) on install, then wires up
 the `pane.agent_status_changed` event automatically.
+
+## Host-window focus in this fork
+
+To enable terminal-window raising without restarting the Herdr server, create
+`config.json` in the directory printed by:
+
+```sh
+herdr plugin config-dir quinnjr.herdr-notifications
+```
+
+```json
+{ "raise_host": true }
+```
+
+This is read on each notification click. `HERDR_NOTIFICATIONS_RAISE_HOST`, when
+set, takes precedence (`1` enables, any other value disables). On Hyprland the
+plugin imports the UI client's compositor connection variable and resolves the
+terminal window by walking the Herdr client's parent processes, rather than
+trying to focus the windowless Herdr process itself.
+
+The plugin runs on the server where it is installed. Installing locally does
+not relay status changes from saved SSH machines to the local desktop. Do not
+turn off Herdr's built-in notifications if you still need those remote events.
+Keeping both enabled can produce duplicate notifications for local agents.
 
 ## Usage
 
@@ -75,9 +106,9 @@ plugin's binary is invoked once per event:
    `location · tab` plus a short `Click to open` hint. Labels come from
    `herdr pane` / `workspace` / `tab` list for the event pane, falling back
    to `HERDR_PLUGIN_CONTEXT_JSON`, then cwd basename / tab id.
-5. Actionable toasts show a single **Close** button where the platform
-   supports notification actions (Linux/BSD, Windows, macOS). Clicking the
-   notification body runs `herdr agent focus <pane_id>` to bring that pane
+5. Actionable toasts register a **default / Open in Herdr** body-click action
+   and a **Close** action. The default action is omitted on XFCE's special
+   dismissal-as-click path. Clicking the notification body runs `herdr agent focus <pane_id>` to bring that pane
    back into view. On Linux, opt in with `HERDR_NOTIFICATIONS_RAISE_HOST=1`
    to also raise the host terminal window via desktop-specific APIs (KWin
    on KDE, GNOME Shell Eval on GNOME, `hyprctl`/`swaymsg` on those

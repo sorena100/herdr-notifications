@@ -16,8 +16,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,10 +52,9 @@ const MAX_LISTEN_REARMS: u32 = 3;
 /// (`0`), for daemons other than XFCE that share the behaviour.
 const CLICK_ON_DISMISS_ENV: &str = "HERDR_NOTIFICATIONS_CLICK_ON_DISMISS";
 
-/// Single actionable toast control. Body/toast click focuses Herdr; this
-/// button only dismisses. Registering a separate `default` action makes
-/// xfce4-notifyd render two buttons, so we rely on daemon-specific body-click
-/// handling instead (see [`dismiss_counts_as_click`]).
+/// This button only dismisses. Standard freedesktop servers also need a
+/// registered `default` action for body clicks. Omit that extra action only
+/// on daemons configured to report a body click as dismissal (e.g. XFCE).
 const CLOSE_ACTION_ID: &str = "close";
 const CLOSE_ACTION_LABEL: &str = "Close";
 /// Shown on actionable status toasts; kept short for small notification bodies.
@@ -145,8 +144,7 @@ struct PluginContext {
 /// Herdr 0.8+ wraps plugin event JSON as `{"event":"...","data":{...}}`.
 /// Older / synthetic payloads may be the bare `data` object with a `type` tag.
 fn parse_event_payload(payload: &str) -> Result<EventData, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(payload).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(payload).map_err(|e| e.to_string())?;
     let body = value.get("data").cloned().unwrap_or(value);
     serde_json::from_value(body).map_err(|e| e.to_string())
 }
@@ -481,7 +479,12 @@ fn parse_notify_args(args: Vec<String>) -> Result<(String, String, Sound), Strin
 /// daemon (stale D-Bus session, unresponsive systemd-user restart) can't
 /// block the initial show forever. When `click_target` is a pane id, the
 /// process stays alive until the toast is activated or dismissed.
-fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Option<&str>) -> Result<(), ()> {
+fn send_notification(
+    summary: &str,
+    body: &str,
+    sound: Sound,
+    click_target: Option<&str>,
+) -> Result<(), ()> {
     let summary = summary.to_string();
     let wants_click = click_target.is_some();
     let body = if wants_click {
@@ -505,8 +508,9 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
         if let Some(name) = sound.name() {
             notification.sound_name(name);
         }
+        let dismiss_is_click = wants_click && dismiss_counts_as_click();
         if wants_click {
-            notification.action(CLOSE_ACTION_ID, CLOSE_ACTION_LABEL);
+            configure_click_actions(&mut notification, dismiss_is_click);
             // Leave urgency alone: Normal is already the XDG default, and
             // `urgency()` does not exist on the default macOS backend
             // (notify-rust gates it behind the `preview-macos-un` feature).
@@ -524,7 +528,7 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
         let _ = shown_tx.send(Ok(()));
 
         if let Some(pane_id) = click_target {
-            let focused = wait_for_focus_click(handle, shown_at, dismiss_counts_as_click());
+            let focused = wait_for_focus_click(handle, shown_at, dismiss_is_click);
             let _ = click_tx.send(focused.then_some(pane_id));
         }
     });
@@ -556,6 +560,13 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
     }
 
     shown
+}
+
+fn configure_click_actions(notification: &mut Notification, dismiss_is_click: bool) {
+    if !dismiss_is_click {
+        notification.action("default", "Open in Herdr");
+    }
+    notification.action(CLOSE_ACTION_ID, CLOSE_ACTION_LABEL);
 }
 
 /// What to do with one response from the notification daemon.
@@ -720,20 +731,30 @@ fn wait_for_focus_click(
 ) -> bool {
     let id = handle.id();
     let after_churn_rearm = Arc::new(AtomicBool::new(false));
-    let mut outcome = capture_outcome(shown_at, dismiss_is_click, after_churn_rearm.clone(), |handler| {
-        let _ = handle.wait_for_response(handler);
-    });
+    let mut outcome = capture_outcome(
+        shown_at,
+        dismiss_is_click,
+        after_churn_rearm.clone(),
+        |handler| {
+            let _ = handle.wait_for_response(handler);
+        },
+    );
 
     for _ in 0..MAX_LISTEN_REARMS {
         match outcome {
             ClickOutcome::Focus => return true,
             ClickOutcome::Stop => return false,
             ClickOutcome::Rearm => {
-                outcome = capture_outcome(shown_at, dismiss_is_click, after_churn_rearm.clone(), |handler| {
-                    let _ = notify_rust::handle_action(id, |response: &ActionResponse<'_>| {
-                        handler.call(&normalize_action_response(response));
-                    });
-                });
+                outcome = capture_outcome(
+                    shown_at,
+                    dismiss_is_click,
+                    after_churn_rearm.clone(),
+                    |handler| {
+                        let _ = notify_rust::handle_action(id, |response: &ActionResponse<'_>| {
+                            handler.call(&normalize_action_response(response));
+                        });
+                    },
+                );
             }
         }
     }
@@ -748,9 +769,14 @@ fn wait_for_focus_click(
 ) -> bool {
     // No re-arm path off XDG: `Dismissed` is never a click on these backends,
     // so nothing is ever classified `Rearm`.
-    capture_outcome(shown_at, dismiss_is_click, Arc::new(AtomicBool::new(false)), |handler| {
-        let _ = handle.wait_for_response(handler);
-    }) == ClickOutcome::Focus
+    capture_outcome(
+        shown_at,
+        dismiss_is_click,
+        Arc::new(AtomicBool::new(false)),
+        |handler| {
+            let _ = handle.wait_for_response(handler);
+        },
+    ) == ClickOutcome::Focus
 }
 
 /// Runs one blocking wait and reports how its response was classified.
@@ -820,7 +846,10 @@ fn normalize_action_response(response: &ActionResponse<'_>) -> NotificationRespo
 /// the pane inside Herdr).
 fn focus_pane(pane_id: &str) {
     let bin = herdr_bin();
-    match Command::new(&bin).args(["agent", "focus", pane_id]).output() {
+    match Command::new(&bin)
+        .args(["agent", "focus", pane_id])
+        .output()
+    {
         Ok(output) if !output.status.success() => {
             eprintln!(
                 "herdr-notifications: `{bin} agent focus {pane_id}` failed: {}",
@@ -837,8 +866,35 @@ fn focus_pane(pane_id: &str) {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PluginConfig {
+    raise_host: bool,
+}
+
 fn should_raise_host_window() -> bool {
-    matches!(env::var(RAISE_HOST_ENV).as_deref(), Ok("1"))
+    if let Ok(value) = env::var(RAISE_HOST_ENV) {
+        return value == "1";
+    }
+    let Some(dir) = env::var_os("HERDR_PLUGIN_CONFIG_DIR") else {
+        return false;
+    };
+    let path = PathBuf::from(dir).join("config.json");
+    match fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<PluginConfig>(&bytes) {
+            Ok(config) => config.raise_host,
+            Err(err) => {
+                eprintln!("herdr-notifications: invalid config {path:?}: {err}");
+                false
+            }
+        },
+        Err(err) => {
+            if err.kind() != ErrorKind::NotFound {
+                eprintln!("herdr-notifications: cannot read config {path:?}: {err}");
+            }
+            false
+        }
+    }
 }
 
 /// Linux desktop hint derived from session environment variables.
@@ -860,6 +916,7 @@ struct LinuxGuiSession {
     wayland_display: Option<String>,
     xdg_current_desktop: Option<String>,
     desktop_session: Option<String>,
+    hyprland_instance_signature: Option<String>,
 }
 
 impl LinuxGuiSession {
@@ -869,6 +926,7 @@ impl LinuxGuiSession {
             wayland_display: map.get("WAYLAND_DISPLAY").cloned(),
             xdg_current_desktop: map.get("XDG_CURRENT_DESKTOP").cloned(),
             desktop_session: map.get("DESKTOP_SESSION").cloned(),
+            hyprland_instance_signature: map.get("HYPRLAND_INSTANCE_SIGNATURE").cloned(),
         }
     }
 
@@ -878,6 +936,7 @@ impl LinuxGuiSession {
             wayland_display: env::var("WAYLAND_DISPLAY").ok(),
             xdg_current_desktop: env::var("XDG_CURRENT_DESKTOP").ok(),
             desktop_session: env::var("DESKTOP_SESSION").ok(),
+            hyprland_instance_signature: env::var("HYPRLAND_INSTANCE_SIGNATURE").ok(),
         }
     }
 
@@ -894,6 +953,9 @@ impl LinuxGuiSession {
         }
         if self.desktop_session.is_none() {
             self.desktop_session = other.desktop_session.clone();
+        }
+        if self.hyprland_instance_signature.is_none() {
+            self.hyprland_instance_signature = other.hyprland_instance_signature.clone();
         }
     }
 
@@ -923,6 +985,9 @@ impl LinuxGuiSession {
         if let Some(ref v) = self.desktop_session {
             cmd.env("DESKTOP_SESSION", v);
         }
+        if let Some(ref v) = self.hyprland_instance_signature {
+            cmd.env("HYPRLAND_INSTANCE_SIGNATURE", v);
+        }
     }
 }
 
@@ -944,7 +1009,10 @@ fn parse_proc_environ(bytes: &[u8]) -> HashMap<String, String> {
 /// coarse desktop profile for choosing a raise strategy.
 fn linux_desktop_from_env(desktop: &str, session: &str) -> LinuxDesktop {
     let combined = format!("{desktop} {session}").to_ascii_lowercase();
-    if ["kde", "plasma"].iter().any(|token| combined.contains(token)) {
+    if ["kde", "plasma"]
+        .iter()
+        .any(|token| combined.contains(token))
+    {
         LinuxDesktop::Kde
     } else if ["gnome", "ubuntu:gnome", "unity"]
         .iter()
@@ -1008,29 +1076,25 @@ fn raise_herdr_host_window() {
     {
         let clients = linux_herdr_ui_client_pids();
         if clients.is_empty() {
-            eprintln!(
-                "herdr-notifications: focused pane but found no Herdr UI client to raise"
-            );
+            eprintln!("herdr-notifications: focused pane but found no Herdr UI client to raise");
             return;
         }
         // systemd-started `herdr server` often has no DISPLAY; import from the
         // UI client process so wmctrl/xdotool can talk to the session.
-        let mut gui = LinuxGuiSession::from_process_env();
         for &pid in &clients {
+            // Keep each candidate's desktop environment separate: never mix
+            // connection variables from clients on different login sessions.
+            let mut gui = LinuxGuiSession::from_process_env();
             if let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) {
                 gui.fill_missing_from(&LinuxGuiSession::from_environ_map(&parse_proc_environ(
                     &bytes,
                 )));
             }
-        }
-        for &pid in &clients {
             if linux_raise_client_pid(pid, &gui) {
                 return;
             }
         }
-        eprintln!(
-            "herdr-notifications: focused pane but could not find a host window to raise"
-        );
+        eprintln!("herdr-notifications: focused pane but could not find a host window to raise");
     }
 }
 
@@ -1151,7 +1215,10 @@ fn linux_kde_activate_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
         if wid.is_empty() {
             continue;
         }
-        for method in ["org.kde.KWin.activateWindow", "org.kde.KWin.forceActiveWindow"] {
+        for method in [
+            "org.kde.KWin.activateWindow",
+            "org.kde.KWin.forceActiveWindow",
+        ] {
             let mut act_cmd = Command::new(qdbus);
             act_cmd.args(["org.kde.KWin", "/KWin", method, &wid]);
             gui.apply_to(&mut act_cmd);
@@ -1191,15 +1258,60 @@ fn linux_gnome_activate_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize)]
+struct HyprlandWindow {
+    pid: u32,
+    address: String,
+}
+
+#[cfg(target_os = "linux")]
+fn hyprland_host_address(
+    pid: u32,
+    windows: &[HyprlandWindow],
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> Option<String> {
+    pick_host_window_id(&[pid], parent_of, |candidate| {
+        windows
+            .iter()
+            .find(|window| {
+                window.pid == candidate
+                    && window
+                        .address
+                        .strip_prefix("0x")
+                        .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok())
+            })
+            .map(|window| window.address.clone())
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn linux_hyprland_focus_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
-    if env::var("HYPRLAND_INSTANCE_SIGNATURE").is_err() {
+    if gui.hyprland_instance_signature.is_none() {
         return false;
     }
+    let mut list = Command::new("hyprctl");
+    list.args(["clients", "-j"]);
+    gui.apply_to(&mut list);
+    let Ok(output) = list.output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(windows) = serde_json::from_slice::<Vec<HyprlandWindow>>(&output.stdout) else {
+        return false;
+    };
+    // Herdr is a terminal child, not a compositor window. Resolve the first
+    // ancestor that actually owns a window before dispatching focus; a
+    // successful hyprctl exit alone does not prove a PID matched anything.
+    let Some(address) = hyprland_host_address(pid, &windows, linux_parent_pid) else {
+        return false;
+    };
     let mut cmd = Command::new("hyprctl");
-    cmd.args(["dispatch", "focuswindow", &format!("pid:{pid}")]);
+    cmd.args(["dispatch", "focuswindow", &format!("address:{address}")]);
     gui.apply_to(&mut cmd);
     cmd.output()
-        .map(|o| o.status.success())
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "ok")
         .unwrap_or(false)
 }
 
@@ -1211,9 +1323,7 @@ fn linux_sway_focus_pid(pid: u32, gui: &LinuxGuiSession) -> bool {
     let mut cmd = Command::new("swaymsg");
     cmd.args([&format!("[con_pid={pid}]"), "focus"]);
     gui.apply_to(&mut cmd);
-    cmd.output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -1414,7 +1524,10 @@ fn herdr_api_socket_path() -> PathBuf {
 
 fn file_age_secs(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
-    SystemTime::now().duration_since(modified).ok().map(|d| d.as_secs())
+    SystemTime::now()
+        .duration_since(modified)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 #[cfg(target_os = "linux")]
@@ -1661,6 +1774,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn standard_notifications_register_default_and_close_actions() {
+        let mut notification = Notification::new();
+        configure_click_actions(&mut notification, false);
+        assert_eq!(
+            notification.actions,
+            ["default", "Open in Herdr", "close", "Close"]
+        );
+    }
+
+    #[test]
+    fn xfce_notifications_preserve_dismissal_click_handling() {
+        let mut notification = Notification::new();
+        configure_click_actions(&mut notification, true);
+        assert_eq!(notification.actions, ["close", "Close"]);
+    }
+
+    #[test]
+    fn host_raise_config_is_opt_in() {
+        assert!(
+            !serde_json::from_str::<PluginConfig>("{}")
+                .unwrap()
+                .raise_host
+        );
+        assert!(
+            serde_json::from_str::<PluginConfig>(r#"{"raise_host":true}"#)
+                .unwrap()
+                .raise_host
+        );
+        assert!(serde_json::from_str::<PluginConfig>(r#"{"raise_host":"true"}"#).is_err());
+    }
+
+    #[test]
+    fn gui_session_imports_hyprland_connection_for_child_commands() {
+        let map = parse_proc_environ(b"HYPRLAND_INSTANCE_SIGNATURE=test-instance\0");
+        let mut gui = LinuxGuiSession::default();
+        gui.fill_missing_from(&LinuxGuiSession::from_environ_map(&map));
+        assert_eq!(
+            gui.hyprland_instance_signature.as_deref(),
+            Some("test-instance")
+        );
+        let mut cmd = Command::new("hyprctl");
+        gui.apply_to(&mut cmd);
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == "HYPRLAND_INSTANCE_SIGNATURE"
+                    && value == Some(std::ffi::OsStr::new("test-instance")))
+        );
+        gui.fill_missing_from(&LinuxGuiSession::from_environ_map(&parse_proc_environ(
+            b"HYPRLAND_INSTANCE_SIGNATURE=another\0",
+        )));
+        assert_eq!(
+            gui.hyprland_instance_signature.as_deref(),
+            Some("test-instance")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hyprland_resolves_terminal_ancestor_not_herdr_pid() {
+        let windows = vec![HyprlandWindow {
+            pid: 10,
+            address: "0xabc".into(),
+        }];
+        let parent = |pid| match pid {
+            100 => Some(50),
+            50 => Some(10),
+            _ => None,
+        };
+        assert_eq!(
+            hyprland_host_address(100, &windows, parent).as_deref(),
+            Some("0xabc")
+        );
+        assert_eq!(hyprland_host_address(200, &windows, parent), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hyprland_rejects_invalid_window_addresses() {
+        let windows = vec![HyprlandWindow {
+            pid: 10,
+            address: ".*".into(),
+        }];
+        assert_eq!(hyprland_host_address(10, &windows, |_| None), None);
+    }
+
+    #[test]
     fn sound_none_has_no_name() {
         assert_eq!(Sound::None.name(), None);
     }
@@ -1840,8 +2039,7 @@ mod tests {
 
     #[test]
     fn parse_notify_args_title_only_defaults_empty_body_and_none_sound() {
-        let (title, body, sound) =
-            parse_notify_args(vec!["--title".into(), "hi".into()]).unwrap();
+        let (title, body, sound) = parse_notify_args(vec!["--title".into(), "hi".into()]).unwrap();
         assert_eq!(title, "hi");
         assert_eq!(body, "");
         assert_eq!(sound, Sound::None);
@@ -1954,7 +2152,10 @@ mod tests {
 
     #[test]
     fn append_click_hint_adds_short_line() {
-        assert_eq!(append_click_hint("scripts · tab"), "scripts · tab\nClick to open");
+        assert_eq!(
+            append_click_hint("scripts · tab"),
+            "scripts · tab\nClick to open"
+        );
         assert_eq!(append_click_hint(""), "Click to open");
     }
 
@@ -1978,7 +2179,12 @@ mod tests {
         let grace = POST_SHOW_LISTEN_GRACE;
         for dismiss_is_click in [true, false] {
             assert_eq!(
-                classify_response(&NotificationResponse::Default, dismiss_is_click, grace, false),
+                classify_response(
+                    &NotificationResponse::Default,
+                    dismiss_is_click,
+                    grace,
+                    false
+                ),
                 ClickOutcome::Focus
             );
             assert_eq!(
@@ -2175,28 +2381,21 @@ mod tests {
 
     #[test]
     fn linux_desktop_from_env_detects_common_sessions() {
-        assert_eq!(
-            linux_desktop_from_env("KDE", "plasma"),
-            LinuxDesktop::Kde
-        );
+        assert_eq!(linux_desktop_from_env("KDE", "plasma"), LinuxDesktop::Kde);
         assert_eq!(
             linux_desktop_from_env("GNOME", "ubuntu"),
             LinuxDesktop::Gnome
         );
-        assert_eq!(
-            linux_desktop_from_env("XFCE", "xfce"),
-            LinuxDesktop::Xfce
-        );
-        assert_eq!(
-            linux_desktop_from_env("i3", "i3"),
-            LinuxDesktop::Generic
-        );
+        assert_eq!(linux_desktop_from_env("XFCE", "xfce"), LinuxDesktop::Xfce);
+        assert_eq!(linux_desktop_from_env("i3", "i3"), LinuxDesktop::Generic);
     }
 
     #[test]
     fn is_herdr_ui_client_argv_accepts_bare_and_flag_launches() {
         assert!(is_herdr_ui_client_argv(&["herdr".into()]));
-        assert!(is_herdr_ui_client_argv(&["/home/u/.local/bin/herdr".into()]));
+        assert!(is_herdr_ui_client_argv(
+            &["/home/u/.local/bin/herdr".into()]
+        ));
         assert!(is_herdr_ui_client_argv(&[
             "herdr".into(),
             "--session".into(),
@@ -2280,6 +2479,7 @@ mod tests {
             wayland_display: None,
             xdg_current_desktop: Some("XFCE".into()),
             desktop_session: Some("xfce".into()),
+            ..LinuxGuiSession::default()
         };
         session.fill_missing_from(&client);
         assert_eq!(session.display.as_deref(), Some(":0.0"));
